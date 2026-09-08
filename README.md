@@ -13,6 +13,7 @@
 ## 安装
 
  `git clone https://github.com/cutLun/comfyui-h3-prompt-gen` 到 `ComfyUI\custom_nodes\`
+<img width="702" height="877" alt="image" src="https://github.com/user-attachments/assets/22d2ab33-4367-4351-8ea8-397f28e33b13" />
 
 ## 模式：MiniMax H3 (视频)
 
