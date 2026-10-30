@@ -50,6 +50,7 @@ ComfyUI 自定义节点：**提示词助手（MiniMax H3 / Krea-2 / Z-Image / �
 - **不是翻译，是分镜**：用户描述只是剧情梗概，AI 必须自己设计镜头数量、机位景别、人物走位与动作衔接、每个镜头的分镜时间；10s 一段是 1–4 个镜头，允许一镜到底的长运镜或固定视角单镜，每个镜头都要有明确目的。
 - **详细度不写字数**：不规定 `detailed_description` 的词数/句数，只要求“按剧情需要写足”：每个镜头覆盖景别与镜头、运镜、外貌服装、走位与手部动作、环境道具、光向色彩、反应、镜头内声音；只写动作算摘要，要展开成镜头实际看到的东西。长度由内容决定，禁止为凑字数注水。
 - **多组续写**：见下方「多段剧情拼接（生成长视频）」。
+  
 
 ### 输出
 
@@ -70,6 +71,8 @@ H3 提示词生成器 ─────────┤                 ├─► l
                                            llama_cpp_model_loader ──► llama_model
                                            llama_cpp_parameters ────► parameters
 ```
+<img width="2367" height="923" alt="image" src="https://github.com/user-attachments/assets/5d1df8d0-39ac-4fcb-89f3-9dbf8af723ab" />
+一键生成MV
 
 要点：
 - `llama_cpp_instruct_adv` 的 **`preset_prompt` 必须选 "Empty - Nothing"**，否则预设会覆盖 `custom_prompt`
