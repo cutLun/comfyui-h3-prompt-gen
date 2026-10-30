@@ -26,22 +26,22 @@ ComfyUI 自定义节点：**提示词助手（MiniMax H3 / Krea-2 / Z-Image / �
 | `group_count` | **剧情组数 / 拼接段数**。`1` = 单段。`N (≥2)` 时进入**多段拼接模式**：在 `user_prompt` 内用单独一行 `---` 分隔出 N 段剧情，输出 **N 组完整、互相衔接的 H3 提示词**，每组对应一段 10s 视频。**Ref2VA 每组六字段**（`subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`），**T2VA 每组三字段**。每组都从 `### Group k` 开头并**完整重写** `subject_definitions`（每个 `<Subject N>` 写明形象来自哪张参考图；没有参考图就用文字描述），不允许写「与 Group 1 相同」之类的缩写。 |
 | `user_prompt` | **主提示词**：只写剧情 / 角色 / 台词即可，镜头机位、人物动作、分镜时间由 AI 设计；台词一律输出中文。T2VA 必填；有图模式（I2VA 等）可留空，只把参考图接给 vlm 节点的 `images` 输入 |
 | `duration_seconds` | 视频时长（秒，H3 支持 4–15），注入 system prompt 的 Target Video Parameters 块 |
-| `视觉风格` | 下拉选择（39 项，与官方/XB 工作流一致：电影感/实拍/复古胶片/黑白电影/纪录片/极简广告/微距/航拍/二维动画/三维CG/日系二次元/美式漫画/皮克斯3D/定格动画/手绘发光/像素艺术/赛博朋克/蒸汽朋克/故障艺术/羊毛毡/折纸/水彩/粘土动画/水墨/油画/纸艺拼贴/剪纸/铅笔素描/浮世绘/敦煌壁画/青花瓷/工笔画/皮影戏/中国风插画/年画/布艺/蜡笔画/哥特萝莉）。选中后强制 `[Shot 1]` 以英文风格名开头并展开具体视觉描述；"GLOBAL MATERIAL OVERRIDE" 风格（水墨/粘土/羊毛毡等）会整体替换世界材质 |
+| `视觉风格` | 下拉选择（39 项：电影感/实拍/复古胶片/黑白电影/纪录片/极简广告/微距/航拍/二维动画/三维CG/日系二次元/美式漫画/皮克斯3D/定格动画/手绘发光/像素艺术/赛博朋克/蒸汽朋克/故障艺术/羊毛毡/折纸/水彩/粘土动画/水墨/油画/纸艺拼贴/剪纸/铅笔素描/浮世绘/敦煌壁画/青花瓷/工笔画/皮影戏/中国风插画/年画/布艺/蜡笔画/哥特萝莉）。选中后强制 `[Shot 1]` 以英文风格名开头并展开具体视觉描述；"GLOBAL MATERIAL OVERRIDE" 风格（水墨/粘土/羊毛毡等）会整体替换世界材质 |
 | `音乐风格` | 下拉选择（22 项：禁止音乐/不指定/钢琴/管弦乐/原声吉他/电子/氛围/合成器浪潮/芯片音乐/Lo-fi/史诗/悬疑/浪漫弦乐/摇滚/爵士/嘻哈/放克/纯人声合唱/极简拟音/国风民乐/戏曲/古琴）。「禁止音乐」强制 `non_diegetic_music: N/A` |
 | `use_api` | **是否直接用 API 生成提示词**（新增）。设为 yes 且 `api_url` 填了正确的 OpenAI 兼容地址时，`final_prompt` 输出口直接产出 H3 提示词；否则 `final_prompt` 输出空字符串，原因通过 `api_status` 输出口给出（中文提示，**不报错**）。 |
-| `api_url` | **OpenAI 兼容 API 地址**（新增）。如 `http://localhost:8080/v1`（llama.cpp server）。支持带 `/v1` 或不带两种写法，**可省略 `http://` 前缀（自动补全）**。地址错误/为空时 `final_prompt` 为空、`api_status` 提示原因，不抛异常。 |
-| `use_random_seed` | **随机种子开关**（新增）。yes=每次生成结果不同（不传 seed 给 API）；no=固定使用下方 `seed` 值，结果可复现。 |
-| `seed` | **固定种子值**（新增，0–4294967295，默认 42）。`use_random_seed=no` 时生效。 |
-| `temperature` | **采样温度**（仅 H3，默认 0.9）。Qwen3.6 常用 0.9；调低更稳、格式更死板，调高更长但更容易跑偏。 |
-| `top_p` | **核采样**（仅 H3，默认 0.95）。Qwen3.6 常用 0.95。 |
-| `top_k` | **top_k 采样**（仅 H3，默认 40）。Qwen3.6 常用 40；0 = 不启用。 |
+| `api_url` | **OpenAI 兼容 API 地址**。如 `http://localhost:8080/v1`（llama.cpp server）。支持带 `/v1` 或不带两种写法，**可省略 `http://` 前缀（自动补全）**。地址错误/为空时 `final_prompt` 为空、`api_status` 提示原因，不抛异常。 |
+| `use_random_seed` | **随机种子开关**。yes=每次生成结果不同（不传 seed 给 API）；no=固定使用下方 `seed` 值，结果可复现。 |
+| `seed` | **固定种子值**`use_random_seed=no` 时生效。 |
+| `temperature` | **采样温度** 常用 0.9；调低更稳、格式更死板，调高更长但更容易跑偏。 |
+| `top_p` | **核采样**（常用 0.95。 |
+| `top_k` | **top_k 采样**（常用 40；0 = 不启用。 |
 | `max_tokens` | **输出 token 上限**（仅 H3，默认 8192，256–32768）。注意这不是上下文：`llama-server -c 65536` 是 prompt+输出的总和。3–5 组输出约 1.5–2K token，8192 足够；组数多或开思考时调到 12288–16384。触顶时 `api_status` 会提示「输出触达 max_tokens 上限」。 |
 | `enable_thinking` | **Qwen3 思考模式**（仅 H3，默认关闭）。开启后思考走 `reasoning_content`，正文在 `content`；必须配合 `reasoning_budget`，否则可能一路想到 `max_tokens` 还没给正文。质量更稳但慢数倍，批量建议关闭。 |
 | `reasoning_budget` | **思考 token 预算**（仅 H3，默认 512，-1=不限 / 0=关闭）。中等思考约 512–1024、深度约 2048+。这是 llama.cpp 的请求参数，实测有效（也是网页端“思考等级”对应的东西）。 |
 | `system_extra` | **追加自定义规则**：拼接到 system prompt 尾部（如"整片保持胶片颗粒质感"） |
-| `image` | **参考图**（新增，可选，IMAGE 类型）。`use_api=yes` 时按 OpenAI 多模态格式传给 API 服务器：I2VA 1 张（首帧）、FL2VA 2 张（首尾帧，batch 接入）、L2VA 1 张（尾帧）、Ref2VA 多张。`use_api=no` 时本输入无影响（参考图照旧接 vlm 节点的 `images`） |
+| `image` | **参考图**（可选，IMAGE 类型）。`use_api=yes` 时按 OpenAI 多模态格式传给 API 服务器：I2VA 1 张（首帧）、FL2VA 2 张（首尾帧，batch 接入）、L2VA 1 张（尾帧）、Ref2VA 多张。`use_api=no` 时本输入无影响（参考图照旧接 vlm 节点的 `images`） |
 
-### 提示词规范（H3 全模式，system prompt 已硬性约束 AI）
+### 提示词规范（H3 全模式,新增，system prompt 已硬性约束 AI）
 
 - **内容不设限、直白不隐喻**：允许粗口、脏话、身体与暴力描写，该说什么词就写什么词；禁止用"心跳加速""空气凝固""百感交集"之类比喻或含蓄说法代替画面。
 - **禁"脸红"及近义词**：脸红 / 脸颊泛红 / 面红耳赤 / 耳根发红 / blush / flushed / rosy cheeks 等一律不出现（连否定式、举例式也不写）；更进一步，禁止描写脸部颜色/温度/充血，尴尬、羞耻、燥热一律改用可见动作（低头、咽口水、攥拳、咬牙、出汗、后退、沉默）。
