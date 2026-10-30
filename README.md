@@ -10,6 +10,12 @@ ComfyUI 自定义节点：**提示词助手（MiniMax H3 / Krea-2 / Z-Image / �
 - **Z-Image (文生图)**：AI 创造性重组、随机性、禁腮红
 - **自定义 / Custom**：完全自定义系统提示词，只保留提示词注入 / API / seed 控件
 
+## 效果演示
+
+[▶ 观看效果演示视频（MiniMax_H3.mp4，约 13 MB）](assets/demo.mp4)
+
+视频为使用本节点生成的 H3 提示词、交给 MiniMax H3 实际出片的效果。
+
 ## 安装
 
 1. `git clone https://github.com/cutLun/comfyui-h3-prompt-gen` 到 `ComfyUI\custom_nodes\`
