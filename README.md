@@ -13,6 +13,7 @@ ComfyUI 自定义节点：**提示词助手（MiniMax H3 / Krea-2 / Z-Image / �
 ## 效果演示
 <img width="2367" height="923" alt="image" src="https://github.com/user-attachments/assets/5d1df8d0-39ac-4fcb-89f3-9dbf8af723ab" />
 qwen3.6-35B推理，一键生成MV
+
 [▶ 观看效果演示视频（MiniMax_H3.mp4，约 13 MB）](assets/demo.mp4)
 
 视频为使用本节点生成的 H3 提示词、交给 MiniMax H3 实际出片的效果。
