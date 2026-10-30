@@ -25,13 +25,16 @@ const COMMON = [
     "use_random_seed", "seed",
     "system_extra",
 ];
+// 非持久化按钮: 测连接 / 拉取模型列表 (不写入 widgets_values)
+const BUTTONS = ["测试连接", "拉取模型"];
 const MODE_EXTRA = {
-    "MiniMax H3 (视频)": ["h3_mode", "group_count", "duration_seconds", "视觉风格", "音乐风格"],
+    "MiniMax H3 (视频)": ["h3_mode", "group_count", "duration_seconds", "视觉风格", "音乐风格",
+                        "temperature", "top_p", "top_k", "max_tokens", "enable_thinking", "reasoning_budget"],
     "Krea-2 (文生图)": ["画面风格", "写实增强"],
     "Z-Image (文生图)": [],
     "自定义 / Custom": ["custom_system_prompt"],
 };
-const MANAGED = new Set([...COMMON, "control_after_generate", ...Object.values(MODE_EXTRA).flat()]);
+const MANAGED = new Set([...COMMON, ...BUTTONS, "control_after_generate", ...Object.values(MODE_EXTRA).flat()]);
 // 控件定义缓存 (beforeRegisterNodeDef 时从后端 INPUT_TYPES 收集, 单一数据源)
 const SPEC_CACHE = {};
 
@@ -39,6 +42,20 @@ const SPEC_CACHE = {};
 export function panelOrder(mode) {
     return [...COMMON, ...(MODE_EXTRA[mode] || [])];
 }
+
+const widgetValue = (node, name) => {
+    const w = (node.widgets || []).find(x => x.name === name);
+    return w ? w.value : "";
+};
+
+const postJson = async (path, body) => {
+    const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    return await r.json();
+};
 
 /** 纯函数: 面板实际控件顺序 —— 前端会自动为 seed 控件追加 control_after_generate
  *  (新前端 seed 机制), 它固定紧跟 seed 之后; 面板保存/加载都按此顺序对齐。 */
@@ -107,6 +124,53 @@ function makeRebuild(node, specs) {
                     };
                 }
             }
+            // 模型列表 / 连接测试按钮 (不持久化, 放在 model_name 下方)
+            const addBtn = (name, cb) => {
+                const w = node.addWidget("button", name, null, cb);
+                w.serialize = false;
+                return w;
+            };
+            const apiArgs = () => ({
+                api_url: widgetValue(node, "api_url"),
+                api_key: widgetValue(node, "api_key"),
+            });
+            addBtn("测试连接", async () => {
+                try {
+                    const d = await postJson("/h3promptgen/models", apiArgs());
+                    if (d.ok) {
+                        const list = (d.models || []).join("\n") || "(空)";
+                        alert("连接成功 (" + d.seconds + "s)\n模型:\n" + list);
+                    } else {
+                        alert("连接失败: " + (d.error || "未知错误"));
+                    }
+                } catch (e) {
+                    alert("请求失败: " + e);
+                }
+            });
+            addBtn("拉取模型", async () => {
+                try {
+                    const d = await postJson("/h3promptgen/models", apiArgs());
+                    if (!d.ok) { alert("连接失败: " + (d.error || "未知错误")); return; }
+                    const models = d.models || [];
+                    if (!models.length) { alert("API 没有返回模型列表"); return; }
+                    const text = models.map((m, i) => (i + 1) + ". " + m).join("\n");
+                    const ans = window.prompt("选择模型（输入序号或名称）:\n" + text, "1");
+                    if (!ans) return;
+                    const idx = parseInt(ans, 10);
+                    const picked = (!isNaN(idx) && idx >= 1 && idx <= models.length) ? models[idx - 1] : ans.trim();
+                    const w = (node.widgets || []).find(x => x.name === "model_name");
+                    if (w) {
+                        w.value = picked;
+                        node.setDirtyCanvas?.(true, true);
+                    }
+                } catch (e) {
+                    alert("请求失败: " + e);
+                }
+            });
+            const btns = BUTTONS.map(n => (node.widgets || []).find(w => w.name === n)).filter(Boolean);
+            for (const b of btns) node.widgets.splice(node.widgets.indexOf(b), 1);
+            const mi = (node.widgets || []).findIndex(w => w.name === "model_name");
+            if (mi >= 0 && btns.length) node.widgets.splice(mi + 1, 0, ...btns);
             node.setSize([node.size[0], node.computeSize()[1]]);
             node.graph?.setDirtyCanvas?.(true, true);
             // 5. 把保存的 control_after_generate 值应用回前端自动添加的 companion

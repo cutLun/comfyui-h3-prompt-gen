@@ -14,6 +14,7 @@ H3PromptGenerator — ComfyUI 自定义节点 (方案2: 纯提示词工程, 不�
 
 零第三方依赖, 不 import comfy 模块, 可独立测试。
 """
+import asyncio
 import collections
 import hashlib
 import json
@@ -23,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 # ─────────────────────────────────────────────────────────────
 # 排队预生成 (Prefetch) 缓存
@@ -39,7 +41,8 @@ _PREGEN_MAX_KEYS = 512
 
 
 def _pregen_key(system, prompt, api_url, temperature, top_p, max_tokens, seed_arg,
-                api_key, model_name, image_mode=False):
+                api_key, model_name, image_mode=False, top_k=0, enable_thinking=False,
+                reasoning_budget=512):
     """由「API 请求的完整决定因素」生成缓存键 —— 前端入队预生成与节点执行时
     走同一套 build 代码, 组装的 system/prompt 一致, 键必然一致。
 
@@ -50,8 +53,8 @@ def _pregen_key(system, prompt, api_url, temperature, top_p, max_tokens, seed_ar
     h.update(_PREGEN_VERSION.encode("utf-8"))
     h.update(b"\x00img" if image_mode else b"\x00txt")
     for part in (system or "", prompt or "", api_url or "",
-                 repr(temperature), repr(top_p), repr(max_tokens),
-                 repr(seed_arg), api_key or "", model_name or ""):
+                 repr(temperature), repr(top_p), repr(top_k), repr(enable_thinking),
+                 repr(reasoning_budget), repr(max_tokens), repr(seed_arg), api_key or "", model_name or ""):
         h.update(b"\x00")
         h.update(str(part).encode("utf-8", "replace"))
     return h.hexdigest()
@@ -86,8 +89,10 @@ NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 SYS_DIR = os.path.join(NODE_DIR, "system_prompts")
 FALLBACK_FILE = os.path.join(NODE_DIR, "fallback_system.txt")
 
-MINI_FALLBACK = """You are an expert MiniMax H3 video prompt writer. Convert the user's request into a precisely formatted H3 video generation prompt.
-Output ONLY the final prompt, in English, starting DIRECTLY with the field labels. Preserve dialogue and lyrics verbatim in their original language inside <d>[LANG] ...</d>.
+# 生成后校验用的禁词 (脸红及近义词)
+
+MINI_FALLBACK = """You are an expert MiniMax H3 video prompt writer and shot designer. Convert the user's story brief into a precisely formatted H3 video generation prompt.
+Output ONLY the final prompt, in English, starting DIRECTLY with the field labels. Write every spoken or sung line in Chinese inside <d>[中文] ...</d>; keep user-supplied lines verbatim. Singing uses `sings:` instead of `says:`.
 Use this exact format:
 integrated_multimodal_description: [Shot 1] <style>, <opening composition> ...
 [Shot 2] At MM:SS.mmm, the camera cuts to ...
@@ -96,7 +101,7 @@ overall_soundscape: <ambient + physical sounds, 1-4 sentences>
 
 non_diegetic_music: <instrumentation/tempo/dynamics, 1-3 sentences, or N/A>
 
-Rules: [Shot 1] has no timestamp; later shots use strictly increasing cut times inside the video duration. Camera motion is written as natural English (motion type + amplitude + speed). Speakers use stable IDs (S1), (S2). Never translate user dialogue; keep it verbatim in <d>. Visible on-screen text goes in English double quotes. Use N/A where a section does not apply."""
+Rules: design the shots and blocking instead of translating the brief (a 10-second clip uses 1–4 shots, and a single continuous shot is valid). [Shot 1] has no timestamp; later shots use strictly increasing cut times inside the video duration. Camera motion is written as natural English (motion type + amplitude + speed). Speakers use stable IDs (S1), (S2). A shout or a name called out is dialogue inside <d>, never prose. Never use 脸红 or any blush synonym (blush, flushed, rosy cheeks). Visible on-screen text goes in English double quotes. Use N/A where a section does not apply."""
 
 MODE_OPTIONS = [
     "T2VA (文生视频)",
@@ -442,20 +447,24 @@ class H3PromptGenerator:
                 "mode": (MODE_OPTIONS,),
                 "group_count": ("INT", {
                     "default": 1, "min": 1, "max": 99, "step": 1,
-                    "tooltip": "剧情组数 / 拼接段数。设为 1 = 单段(与原节点一致); 设为 N(≥2) 时, "
-                               "在 user_prompt 内用『---』分隔出 N 段描述, vlm 将输出 N 组相互衔接的 H3 提示词, "
-                               "长视频即由这 N 组依次拼接而成。",
+                    "tooltip": "剧情组数 / 拼接段数。1 = 单段; N(≥2) 时在 user_prompt 内用单独一行『---』分隔 N 段剧情, "
+                               "输出 N 组完整且互相衔接的 H3 提示词 (每组 = 一段 10s 视频)。Ref2VA 每组六字段 "
+                               "(subject_definitions/summary/retention_analysis/detailed_description/"
+                               "overall_soundscape/non_diegetic_music), T2VA 每组三字段; 每组都重写全部字段, "
+                               "长视频由这 N 组依次拼接而成。",
                 }),
                 "user_prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "placeholder": "多段拼接: 每组一段描述, 用单独一行『---』分隔。示例:\n\n"
-                                   "清晨城市街道, 主角推开咖啡馆的门。\n"
+                    "placeholder": "只写剧情和台词即可, 镜头机位/人物动作/分镜时间由 AI 设计。多段拼接时每组一段, "
+                                   "用单独一行『---』分隔。示例:\n\n"
+                                   "深夜出租屋, 阿强把一沓钱拍在桌上:『钱我凑齐了, 明天你就走。』\n"
                                    "---\n"
-                                   "主角走进厨房, 发现桌上放着一封未拆的信。\n"
+                                   "阿珍数完钱发现少了一半, 把钱摔在他脸上:『少了三千, 你他妈又拿去赌了?』\n"
                                    "---\n"
-                                   "主角拆开信件, 脸色骤变, 冲出门外。\n\n"
-                                   "(单段模式可只写一段, 无需分隔符; I2VA/FL2VA/L2VA/Ref2VA 可留空只传参考图给 vlm 节点)",
+                                   "阿强低头点烟, 阿珍抓起外套冲进雨里, 他在后面喊:『阿珍!』\n\n"
+                                   "(台词一律输出中文; 单段模式可只写一段, 无需分隔符; I2VA/FL2VA/L2VA/Ref2VA "
+                                   "可留空只传参考图给 vlm 节点)",
                 }),
                 "duration_seconds": ("INT", {
                     "default": 10, "min": 4, "max": 15, "step": 1,
@@ -487,6 +496,32 @@ class H3PromptGenerator:
                 }),
             },
             "optional": {
+                "temperature": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "采样温度。Qwen3.6 常用 0.9；越低越稳、越高越长。",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "核采样 top_p。Qwen3.6 常用 0.95。",
+                }),
+                "top_k": ("INT", {
+                    "default": 40, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "top_k 采样。Qwen3.6 常用 40；0 = 不启用。",
+                }),
+                "max_tokens": ("INT", {
+                    "default": 8192, "min": 256, "max": 32768, "step": 256,
+                    "tooltip": "输出 token 上限（不是上下文）。3–5 组一般 8192 足够；组数很多或开思考时调到 12288–16384。"
+                               "上限受服务端 -c 约束，不要超过上下文。",
+                }),
+                "enable_thinking": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Qwen3 思考模式：开启=先推理再输出（质量更稳但慢数倍，且可能吃满 max_tokens）。需配合 reasoning_budget；批量出稿建议关闭。",
+                }),
+                "reasoning_budget": ("INT", {
+                    "default": 512, "min": -1, "max": 8192, "step": 128,
+                    "tooltip": "思考 token 预算（仅 enable_thinking=yes 时生效）：-1 = 不限、0 = 等同关闭；"
+                               "中等思考约 512–1024。llama.cpp 的 reasoning_budget 参数实测有效。",
+                }),
                 "system_extra": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -544,29 +579,48 @@ class H3PromptGenerator:
                 return f.read()
         return MINI_FALLBACK
 
-    def _build_param_block(self, duration_seconds, style, music):
-        """时长 + 视觉风格 + 音乐风格 → 参数块 (英文, 与 XB_ToolBox 注入格式一致)"""
+    def _build_param_block(self, duration_seconds, style, music, mode_key="t2va", groups=1):
+        """时长 + 视觉风格 + 音乐风格 → 参数块 (英文, 与 XB_ToolBox 注入格式一致)。
+
+        多组时说明「每组 N 秒、拼接后总时长」; Ref2VA 的风格开场在 [Shot 1] 之前,
+        其余模式的 [Shot 1] 直接以风格名开头 (官方指南两种写法的差别)。
+        """
         lines = ["## Target Video Parameters (MUST follow exactly)"]
-        lines.append(
-            f"- Duration: exactly {duration_seconds} seconds (all shot timestamps MUST fall "
-            f"within this range; the final shot must end before the {duration_seconds}-second mark)"
-        )
+        if groups > 1:
+            lines.append(
+                f"- Duration: exactly {duration_seconds} seconds PER GROUP ({groups} groups, about "
+                f"{duration_seconds * groups} seconds when concatenated). Inside every group all shot "
+                f"timestamps MUST fall within 0.00–{duration_seconds}.00 s and that group's final shot "
+                f"must end before the {duration_seconds}-second mark."
+            )
+        else:
+            lines.append(
+                f"- Duration: exactly {duration_seconds} seconds (all shot timestamps MUST fall "
+                f"within this range; the final shot must end before the {duration_seconds}-second mark)"
+            )
         if "Unspecified" not in style:
             en_name = style.split(" / ")[-1]  # "中文 / English" → English
             hint = _STYLE_HINTS.get(style, "")
             lines.append(f"- Visual style: {en_name} — {hint}")
-            lines.append(
-                f'  ⚠️ [Shot 1] MUST begin with "{en_name}" and immediately elaborate with 1-2 sentences '
-                f'of concrete visual description — textures, lighting, colors, motion characteristics that '
-                f'define this style. Do NOT just name the style and move on. Show what the style actually looks like.'
-            )
-            lines.append(
-                f'  Correct: "[Shot 1] {en_name}, the characters have the rounded tactile quality of '
-                f'hand-sculpted clay with visible fingerprints and tool marks..."'
-            )
-            lines.append(
-                f'  Wrong: "[Shot 1] {en_name}, a medium-wide shot..." (name only, no visual description)'
-            )
+            if mode_key == "ref2va":
+                lines.append(
+                    f'  ⚠️ Open detailed_description with 1-2 English sentences that establish "{en_name}" '
+                    f'and show what it looks like — textures, lighting, colors, motion characteristics — '
+                    f'BEFORE [Shot 1]. [Shot 1] follows immediately after and must not repeat the style name.'
+                )
+            else:
+                lines.append(
+                    f'  ⚠️ [Shot 1] MUST begin with "{en_name}" and immediately elaborate with 1-2 sentences '
+                    f'of concrete visual description — textures, lighting, colors, motion characteristics that '
+                    f'define this style. Do NOT just name the style and move on. Show what the style actually looks like.'
+                )
+                lines.append(
+                    f'  Correct: "[Shot 1] {en_name}, the characters have the rounded tactile quality of '
+                    f'hand-sculpted clay with visible fingerprints and tool marks..."'
+                )
+                lines.append(
+                    f'  Wrong: "[Shot 1] {en_name}, a medium-wide shot..." (name only, no visual description)'
+                )
         if "Unspecified" not in music:
             en_name = music.split(" / ")[-1]  # "中文 / English" → English
             hint = _MUSIC_HINTS.get(music, "")
@@ -579,42 +633,189 @@ class H3PromptGenerator:
 
     # ---------- 多段拼接规则注入 ----------
 
-    def _build_multisegment_rule(self, group_count):
+    @staticmethod
+    def _image_count(image):
+        """统计本次请求实际附带的参考图数量 (torch/numpy [B,H,W,C] / list / PIL)。"""
+        if image is None:
+            return 0
+        if isinstance(image, (list, tuple)):
+            return len(image)
+        shape = getattr(image, "shape", None)
+        if shape is not None and len(shape) == 4:
+            return int(shape[0])
+        return 1
+
+    def _asset_notice(self, image):
+        """告诉 Ref2VA 模型实际附带了几张图, 避免它虚构 <Picture 3> 或引用不存在的参考图。"""
+        n = self._image_count(image)
+        if n <= 0:
+            return ("# Attached assets\nNo reference image is attached to this request: there is no <Picture N>, "
+                    "describe every subject in words.")
+        pics = ", ".join("<Picture %d>" % i for i in range(1, n + 1))
+        return ("# Attached assets\nExactly %d reference image(s) are attached: %s. No other <Picture N> exists. "
+                "A room or prop without its own image is a <Subject N> described in words." % (n, pics))
+
+    @staticmethod
+    def _group_skeleton(mode_key, duration_seconds):
+        """每组的字段骨架 (按模式): Ref2VA 六段, 基础模式三段 (关键帧模式带对齐行)。"""
+        d = str(duration_seconds)
+        if mode_key == "ref2va":
+            return [
+                "  ### Group k",
+                "  subject_definitions:",
+                "  <Subject 1> is the woman in <Picture 1> — repeat this citation in EVERY group — with ... (or her full text description when no image is attached), and how she looks at the START of Group k",
+                "  <Subject 2> is ...",
+                "  summary:",
+                "  [reference generation] Group k continues from the end of Group k-1: ...",
+                "  retention_analysis:",
+                "  <Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - ...",
+                "  <Subject 2> (appears in [Shot 1]): fully_preserved - ...",
+                "  detailed_description:",
+                "  <one or two style sentences>",
+                "  [Shot 1] ...   (write the full visual detail: framing, blocking, action, environment/light, props, reaction, sound)",
+                "  [Shot 2] At 00:02.700, ...   (the time is only an example — use the moment this beat's action ends; a single continuous shot is also fine)",
+                "  overall_soundscape:",
+                "  ...",
+                "  non_diegetic_music:",
+                "  ...",
+            ]
+        if mode_key == "i2va":
+            return [
+                "  ### Group 1",
+                "  For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.",
+                "",
+                "  integrated_multimodal_description: [Shot 1] ...",
+                "  [Shot 2] At 00:02.700, ...   (the time is only an example — use the moment this beat's action ends; a single continuous shot is also fine)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+                "",
+                "  ### Group 2 ... Group N",
+                "  integrated_multimodal_description: [Shot 1] ...   (no alignment line: opens exactly on the final frame of the previous group)",
+                "  [Shot 2] At 00:02.700, ...   (the time is only an example — use the moment this beat's action ends; a single continuous shot is also fine)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+            ]
+        if mode_key == "fl2va":
+            return [
+                "  ### Group 1",
+                "  How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video. (Picture 2 is the last frame of Group N, not of Group 1.)",
+                "",
+                "  integrated_multimodal_description: [Shot 1] ...",
+                "  [Shot 2] At 00:02.700, ...   (the time is only an example — use the moment this beat's action ends; a single continuous shot is also fine)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+                "",
+                "  ### Group N",
+                "  How the reference pictures align with the target video — Picture 2 (from Shot M) aligns with the " + d + ".00-second mark of the target video.",
+                "",
+                "  integrated_multimodal_description: ...   (the last shot lands exactly on Picture 2)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+            ]
+        if mode_key == "l2va":
+            return [
+                "  ### Group 1 ... Group N-1",
+                "  integrated_multimodal_description: [Shot 1] ...   (no alignment line: a plausible earlier state that leads into the next group)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+                "",
+                "  ### Group N",
+                "  How the reference pictures align with the target video — <Picture 1> (from [Shot M]) aligns with the " + d + ".00-second mark of the target video.",
+                "",
+                "  integrated_multimodal_description: ...   (the last shot lands exactly on <Picture 1>)",
+                "  overall_soundscape: ...",
+                "  non_diegetic_music: ...",
+            ]
+        return [
+            "  ### Group k",
+            "  integrated_multimodal_description: [Shot 1] ...",
+            "  [Shot 2] At 00:02.700, ...   (example time — replace it; or delete this line and keep one shot with no cut at all)",
+            "  overall_soundscape: ...",
+            "  non_diegetic_music: ...",
+        ]
+
+    def _build_multisegment_rule(self, mode_key, group_count, duration_seconds):
         """多段剧情拼接 (>=2) 的专用 system prompt 增强段。
 
-        指令 vlm 节点产出 N 组完整 H3 提示词, 第 i+1 组画面/情节衔接第 i 组结尾。
-        返回一段英文规则文本, 拼接到各模式 system prompt 的 Target Video Parameters 之后。
-        使用「列表 + _NL.join」构造, 避免源码中出现易被工具误转义的 \\n 转义序列。
+        每组 = 一段独立 10s 视频的完整提示词; 第 k+1 组承接第 k 组结尾并推进新剧情。
+        字段结构按模式区分 (Ref2VA 六段 / 基础模式三段 / 关键帧模式对齐行), 并强制每组
+        重写 subject_definitions 等全部字段, 不允许「与 Group N 相同」之类的缩写。
+        使用「列表 + _NL.join」构造, 避免源码中出现易被工具误转义的反斜杠转义序列。
         """
+        n = str(group_count)
+        d = str(duration_seconds)
         L = []
-        L.append("# Multi-Sequence Continuation (N = " + str(group_count) + " groups)")
-        L.append("The user provides " + str(group_count) + " separate story beats (one paragraph each, separated by a lone line of '---').")
-        L.append("Generate exactly " + str(group_count) + " COMPLETE and SELF-CONTAINED MiniMax H3 prompts, one per story beat, in this exact format:")
+        L.append("# Multi-group long video (" + n + " groups, " + d + " seconds each)")
+        L.append("The user message contains " + n + " story beats, each prefixed with a marker '[Group k]'; the marker "
+                 "tells you which block must dramatize that beat (it is not text to copy). Beats are separated by a "
+                 "lone line of '---'. Generate exactly " + n + " COMPLETE prompt blocks, headed "
+                 "'### Group 1' ... '### Group " + n + "', in order.")
+        L.append("Each block is a self-contained prompt for ONE " + d + "-second clip. The clips are concatenated in order "
+                 "into one long film, so Group k+1 continues exactly where Group k stopped and then moves the story forward.")
         L.append("")
-        L.append("  ### Group 1")
-        L.append("  integrated_multimodal_description: [Shot 1] ...")
-        L.append("  overall_soundscape: ...")
-        L.append("  non_diegetic_music: ...")
+        L.append("## Required structure of EVERY block")
+        L.extend(self._group_skeleton(mode_key, d))
         L.append("")
-        L.append("  ### Group 2")
-        L.append("  integrated_multimodal_description: [Shot 1] ...")
-        L.append("  overall_soundscape: ...")
-        L.append("  non_diegetic_music: ...")
+        L.append("## Continuity rules (MANDATORY)")
+        rules = [
+            "HAND-OFF: Group k+1 opens on the exact final visible state of Group k — same pose, same room, same light, "
+            "same props, same clothing state — in ONE clause (e.g. 'the door Group 1 left open still swings'), then starts "
+            "its own new action in the same breath.",
+            "NO REPLAY: never re-describe or re-shoot what an earlier group already showed, and never repeat a line of "
+            "dialogue. If Group 1 showed him slamming the money down, Group 2 does not slam it down again.",
+            "LINE OWNERSHIP: a supplied line belongs to the beat that contains it. Group k speaks its own beat's lines "
+            "(plus lines you invent to bridge inside that beat); never move a later beat's line into an earlier group, "
+            "and never repeat the same line in two groups.",
+            "ALWAYS ADVANCE: every group adds at least one new action, reaction or piece of information. If a beat would "
+            "repeat the previous group, escalate it or show its consequence instead.",
+            "CORRECT INDEX: each summary names the group it continues from, and the index is correct — Group 2 "
+            "continues Group 1, Group 3 continues Group 2, and so on. Never say Group 3 continues Group 1.",
+            "ONE BEAT = ONE GROUP: exactly " + n + " groups for " + n + " beats. Never split one beat into two groups "
+            "and never merge two beats into one group, however many actions a beat contains — design 1–4 shots "
+            "inside that group.",
+            "BEAT BOUNDARIES: Group k dramatizes beat k only. No action or line that belongs to beat k+1 may happen "
+            "inside Group k — no early exit, no early arrival, no early confession — and every supplied action and "
+            "line of beat k must happen inside Group k.",
+            "SHOTS AND CUTS: design the shot count (1–4) and each shot's length from the beat itself. A group with one "
+            "action may be a single take — a long take that follows the action, or a locked-off static view — but a "
+            "beat with several actions, a viewpoint change, or a reaction worth seeing usually needs 2–3 shots. Across "
+            "the " + n + " groups, mix single takes and cuts: do not give every group the same shot pattern. Every cut "
+            "must be justified by what happens at that moment — put the cut time where the previous action ends, never "
+            "copy a template time and never reuse another group's cut list.",
+            "CARRY THE LOOK: every group restates every subject in full as it looks at the START of that group, including "
+            "accumulated changes (jacket off stays off, blood on the collar stays, hair soaked by the rain stays soaked).",
+            "NO ABBREVIATION: every block repeats the complete structure with real content. Never write 'same as Group 1', "
+            "'continues as before', 'omitted', '...' or leave a field empty. A subject that appears in more than one "
+            "group keeps its number in every group (<Subject 1> is always the same person); a subject local to one "
+            "group takes the next unused number in that group. Speaker IDs also keep their numbers (S1 stays S1).",
+            "REFERENCE EVERY GROUP: every group's subject_definitions names the reference asset for each subject that "
+            "has one — '<Subject 1> is the woman in <Picture 1>, ...' — and rewrites how that subject looks at the "
+            "start of the group. Never drop the <Picture N> citation after Group 1 and never reduce a subject to "
+            "'the same woman'. With no attached image, rewrite the full text description (build, hair, face, "
+            "clothing state) in every group and invent no <Picture N>.",
+            "TIMESTAMPS restart inside every group: [Shot 1] has no timestamp; later cuts are strictly increasing within "
+            "0.00–" + d + ".00 s and the group's last shot ends before " + d + ".00 s. A single-shot group has no cut "
+            "time at all.",
+            "CONSISTENCY: same Visual style and Background music style in every group (unless the user asks for a change), "
+            "same location, same time of day, same cast. Do not re-cast or re-design anyone.",
+            "OUTPUT: all " + n + " blocks in one reply, nothing before '### Group 1', nothing after the last "
+            "non_diegetic_music line.",
+        ]
+        for i, rule in enumerate(rules, 1):
+            L.append(str(i) + ". " + rule)
         L.append("")
-        L.append("  ... (one ### Group k block for every group, in order) ...")
+        L.append("FINAL CHECK before you answer: every group must contain every field of this mode — a group that stops "
+                 "after detailed_description is incomplete. count your '### Group' headers — there must be exactly " + n + ", never an "
+                 "extra group for a busy beat (compress its actions into 1–4 shots instead). Then list every group's "
+                 "shot count and cut times. If two groups share the same cut time, or a cut sits at the exact midpoint "
+                 "of the clip with no action landing there, move it to the moment that group's action actually ends. A "
+                 "group with one continuous shot has no cut time — that is allowed, and it is better than a midpoint "
+                 "cut. Every shot is its own line starting with `[Shot N]`; 'the camera cuts to' buried inside a "
+                 "paragraph is a format error. If a beat says someone shouts, calls, answers or curses, those words "
+                 "must be inside <d>.")
         L.append("")
-        L.append("Each group is an independent H3 clip of duration_seconds long. Concatenate them back-to-back to form ONE continuous long video. The groups MUST chain seamlessly AND MUST NOT repeat each other:")
-        L.append("")
-        L.append("1. **CONTINUITY, NOT REPLAY (MANDATORY)**: Group i+1 picks up where Group i ended, but it must IMMEDIATELY move FORWARD with new story content. Do NOT re-describe the events that already happened in previous groups, do NOT replay their shots, do NOT restate their dialogue. The opening shot of Group i+1 may only establish the minimal spatial/state link (e.g. 'the door the man just opened swings wide', 'the letter lies open in her hands'), then within ONE sentence the new group must start its OWN new beat — new action, new dialogue, new development. If Group 1 already showed the man walking into the cafe, Group 2 must NOT show him walking into the cafe again.")
-        L.append("2. **Each group tells ONLY its own beat**: Group k's content is driven by story beat k. Build its shots from that beat alone. Previous groups' events are BACKGROUND FACTS to reference in one clause at most ('having just opened the letter, she...'), never scenes to re-enact.")
-        L.append("3. **Always advance the story**: every group must introduce at least one NEW piece of information, NEW action, or NEW reaction not present in any earlier group. If a new group would say the same thing as the previous one, instead escalate or resolve: show the CONSEQUENCE, not the repeated cause.")
-        L.append("4. **Carry the hook**: if a group ends on a suspense/unresolved beat, the next group opens by acknowledging it briefly and then resolving or escalating it with a NEW development.")
-        L.append("5. **Keep identities constant**: reuse the exact same character descriptions, clothing, names, and visual style across all groups — never reintroduce or alter them. Reuse stable speaker IDs (S1, S2). Do NOT re-introduce characters as if they were new.")
-        L.append("6. **Style consistency**: apply the same Visual style and Background music style to every group (unless the user specifies per-group variation). Each Group's [Shot 1] must still open with the Visual style label as required by the mode rules.")
-        L.append("7. **Timestamps restart per group**: within each group, [Shot 1] has NO timestamp and later shots use strictly increasing cut times inside that group's duration_seconds; the last shot of each group ends before the group's duration mark.")
-        L.append("8. Follow every rule from the mode-specific system prompt (field names, section order, verbatim dialogue, camera-motion vocabulary, quality checks) INSIDE each group. Do NOT invent new field names or merge groups. Output ALL " + str(group_count) + " groups.")
-        L.append("")
-        L.append("Story beats provided by the user:")
+        L.append("Follow every rule from the mode-specific system prompt (field names, section order, Chinese dialogue, "
+                 "camera vocabulary, quality checks) inside each block.")
         return _NL.join(L)
 
     # ---------- API 调用 (可选: 直接产出 H3 提示词) ----------
@@ -657,11 +858,47 @@ class H3PromptGenerator:
     @staticmethod
     def _build_opener(url):
         """按目标地址选择 opener: 私网/回环地址 → 无代理直连; 公网地址 → 跟随环境变量代理。"""
-        from urllib.parse import urlparse
         host = urlparse(url).hostname or ""
         if H3PromptGenerator._is_private_host(host):
             return urllib.request.build_opener(urllib.request.ProxyHandler({}))
         return urllib.request.build_opener()
+
+    @staticmethod
+    def _open_url(req, url, timeout):
+        """打开请求。若公网代理指向的本机端口没开 (WinError 10061/连接被拒), 自动改直连重试一次。"""
+        opener = H3PromptGenerator._build_opener(url)
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            msg = (str(getattr(e, "reason", "")) + " " + str(e)).lower()
+            if "10061" in msg or "refused" in msg or "积极拒绝" in msg:
+                # 注意: 失败的代理请求会污染原 Request (host 被改成代理地址),
+                # 直连必须用全新 Request, 否则会继续连代理端口。
+                headers = {k: v for k, v in req.headers.items() if k.lower() != "host"}
+                direct_req = urllib.request.Request(
+                    req.full_url, data=req.data, headers=headers, method=req.get_method())
+                direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                return direct.open(direct_req, timeout=timeout)
+            raise
+
+    @staticmethod
+    def _models_url(api_url):
+        base = H3PromptGenerator._norm_api_url(api_url)
+        return base + "/models" if base.endswith("/v1") else base + "/v1/models"
+
+    @staticmethod
+    def _fetch_models(api_url, api_key=""):
+        """GET /v1/models; 返回 (模型 id 列表, 耗时秒)。用于“测试连接 / 拉取模型”。"""
+        url = H3PromptGenerator._models_url(api_url)
+        headers = {"Accept": "application/json"}
+        if api_key and api_key.strip():
+            headers["Authorization"] = "Bearer " + api_key.strip()
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        t0 = time.time()
+        with H3PromptGenerator._open_url(req, url, 20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        models = [m.get("id") or m.get("name") for m in (body.get("data") or body.get("models") or [])]
+        return [m for m in models if m], time.time() - t0
 
     @staticmethod
     def _api_completions_url(api_url):
@@ -740,8 +977,9 @@ class H3PromptGenerator:
         return urls
 
     def _call_api(self, api_url, system, user_prompt, image=None, seed=None,
-                  temperature=0.1, top_p=0.3, max_tokens=8192, timeout=600,
-                  api_key=None, model_name=""):
+                  temperature=0.9, top_p=0.95, max_tokens=8192, timeout=600,
+                  api_key=None, model_name="", top_k=40, enable_thinking=False,
+                  reasoning_budget=512):
         """调用 OpenAI 兼容 API 生成提示词 (支持多模态传图 + 固定种子 + 采样参数覆盖 + Bearer Key)。
 
         返回 (final_prompt, status):
@@ -766,11 +1004,23 @@ class H3PromptGenerator:
             "top_p": top_p,
             "max_tokens": max_tokens,
             "stream": False,
-            # llama.cpp 推理模型 (Qwen3 thinking) 必须关掉思考, 否则 content 为空
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        # Qwen3 思考模式: 思考走 reasoning_content, 正文在 content;
+        # reasoning_budget 限制思考 token 数 (llama.cpp 请求参数, 实测有效)。
+        budget = int(reasoning_budget)
+        thinking = bool(enable_thinking) and budget != 0
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking}
+        if thinking and budget > 0:
+            payload["reasoning_budget"] = budget
+        if top_k:
+            payload["top_k"] = int(top_k)
         if seed is not None:
             payload["seed"] = int(seed) & 0xFFFFFFFF
+        # 本地 llama.cpp / LM Studio 支持 cache_prompt: 复用 system 前缀的 KV 缓存,
+        # 同一模式反复生成时省掉整段 prefill (实测 5.3K token 从 ~30s 降到 <1s)。
+        # 公网 OpenAI 接口不认识该字段会报 400, 所以只对私网/回环地址发送。
+        if self._is_private_host(urlparse(url).hostname or ""):
+            payload["cache_prompt"] = True
         if model_name and model_name.strip():
             payload["model"] = model_name.strip()
         headers = {"Content-Type": "application/json"}
@@ -782,12 +1032,10 @@ class H3PromptGenerator:
             headers=headers,
             method="POST",
         )
-        # 私网/回环地址 (如局域网 llama-server) 必须无代理直连:
-        # 否则环境变量 HTTP_PROXY 指向的代理未开时, urllib 报 WinError 10061。
-        opener = self._build_opener(url)
+        # 私网/回环地址直连; 公网若代理未开 (10061) 会自动改直连重试一次
         t0 = time.time()
         try:
-            with opener.open(req, timeout=timeout) as resp:
+            with self._open_url(req, url, timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             return "", "API 返回 HTTP %s: %s" % (e.code, e.reason)
@@ -796,15 +1044,32 @@ class H3PromptGenerator:
         except Exception as e:
             return "", "API 请求失败: %s" % e
         try:
-            msg = body["choices"][0]["message"]
+            choice = body["choices"][0]
+            msg = choice["message"]
             text = msg.get("content") or ""
-            # 推理模型兜底: content 空时尝试 reasoning_content 提取最终答案
-            if not text.strip():
-                rc = msg.get("reasoning_content") or ""
-                text = rc.strip()
+            finish = (choice.get("finish_reason") or "").lower()
+            # 关闭思考时: content 空可退回 reasoning_content (部分推理模型只给 reasoning)。
+            # 开启思考时不回退, 否则会把思考过程当正文写进 final_prompt。
+            if not text.strip() and not thinking:
+                text = (msg.get("reasoning_content") or "").strip()
             elapsed = time.time() - t0
             if text.strip():
-                return text.strip(), "OK (%.1fs, %d 张图)" % (elapsed, len(data_urls))
+                timing = body.get("timings") or {}
+                pred = timing.get("predicted_n")
+                tps = timing.get("predicted_per_second")
+                detail = ""
+                if pred:
+                    detail += ", %d tok" % pred
+                if tps:
+                    detail += " @%.0f tok/s" % tps
+                status = "OK (%.1fs, %d 张图%s)" % (elapsed, len(data_urls), detail)
+                if finish == "length":
+                    status += " | ⚠ 输出触达 max_tokens 上限，可能被截断 (调大 max_tokens)"
+                return text.strip(), status
+            if thinking:
+                return "", ("思考未在预算内产出正文 (finish=%s, max_tokens=%d, reasoning_budget=%d)；"
+                            "请调大 max_tokens 或降低 reasoning_budget" % (
+                                finish or "?", max_tokens, budget))
             return "", "API 未返回内容 (%.1fs)" % elapsed
         except Exception as e:
             return "", "API 响应解析失败: %s" % e
@@ -815,12 +1080,18 @@ class H3PromptGenerator:
               视觉风格="不指定 / Unspecified", 音乐风格="禁止音乐 / No Music",
               use_api=False, api_url="", use_random_seed=True, seed=42,
               system_extra="", image=None, api_key=None, model_name="",
-              consume_pregen=True):
+              consume_pregen=True, temperature=0.9, top_p=0.95, top_k=40,
+              enable_thinking=False, max_tokens=8192, reasoning_budget=512):
         mode_key = _mode_key(mode)
         segments = self._split_segments(user_prompt)
         group_count = int(group_count)
         final_prompt = ""
         api_status = ""
+        sampling = dict(api_key=api_key, model_name=model_name,
+                        consume_pregen=consume_pregen, mode_key=mode_key,
+                        temperature=float(temperature), top_p=float(top_p),
+                        top_k=int(top_k), enable_thinking=bool(enable_thinking),
+                        max_tokens=int(max_tokens), reasoning_budget=int(reasoning_budget))
 
         # 单段路径 (group_count == 1): 与原节点行为完全一致, user_prompt 视为单段
         if group_count == 1:
@@ -834,10 +1105,11 @@ class H3PromptGenerator:
                 prompt = ("Generate the H3 video prompt based on the provided reference image(s). "
                           "Follow the system prompt exactly.")
             system = self._build_single_system(mode_key, duration_seconds, 视觉风格, 音乐风格, system_extra)
+            if mode_key == "ref2va" and (use_api or image is not None):
+                system = system.rstrip() + _NL + _NL + self._asset_notice(image)
             final_prompt, api_status = self._maybe_api(use_api, api_url, system, prompt, image,
                                                        use_random_seed, seed,
-                                                       api_key=api_key, model_name=model_name,
-                                                       consume_pregen=consume_pregen)
+                                                       groups=1, **sampling)
             return system, prompt, final_prompt, api_status
 
         # 多段路径 (group_count >= 2)
@@ -845,27 +1117,30 @@ class H3PromptGenerator:
             raise ValueError(
                 "多段模式 (group_count ≥ 2) 必须在 user_prompt 内用单独一行『---』分隔出 %d 段描述。" % group_count
             )
-        # 用户段落按原样拼接: 保留 --- 分隔符, 与 system prompt 中 "separated by a lone line of '---'" 一致
-        prompt = (_NL + _NL + "---" + _NL + _NL).join(segments)
+        # 每段前加 [Group k] 标记: 把「哪段剧情属于哪一组」显式绑定, 避免模型把后一段的动作提前塞进前一组
+        # (标记只是给模型的对应关系, system prompt 里会说明不要复制进输出)
+        prompt = (_NL + _NL + "---" + _NL + _NL).join(
+            "[Group %d] %s" % (i, seg) for i, seg in enumerate(segments, 1))
 
-        # 单段 system prompt 基础
-        system = self._build_single_system(mode_key, duration_seconds, 视觉风格, 音乐风格, system_extra)
-        # 追加多段拼接规则 + 用户提供的段落
-        system = system.rstrip() + _NL + _NL + self._build_multisegment_rule(group_count)
-        if prompt:
-            system = system + _NL + prompt
-        else:
-            system = system.rstrip() + _NL + _NL + "(每个段落描述要生成的内容: 场景 / 角色 / 动作 / 台词...)"
+        # 单段 system prompt 基础 (参数块按模式与组数生成)
+        system = self._build_single_system(mode_key, duration_seconds, 视觉风格, 音乐风格,
+                                           system_extra, groups=group_count)
+        # 追加多段拼接规则 (字段结构按模式区分); 剧情段落只在 user message 里, 不重复塞进 system
+        system = system.rstrip() + _NL + _NL + self._build_multisegment_rule(
+            mode_key, group_count, duration_seconds)
+        if mode_key == "ref2va" and (use_api or image is not None):
+            system = system.rstrip() + _NL + _NL + self._asset_notice(image)
 
         final_prompt, api_status = self._maybe_api(use_api, api_url, system, prompt, image,
                                                    use_random_seed, seed,
-                                                   api_key=api_key, model_name=model_name,
-                                                   consume_pregen=consume_pregen)
+                                                   groups=group_count, **sampling)
         return system, prompt, final_prompt, api_status
 
     def _maybe_api(self, use_api, api_url, system, prompt, image=None,
-                   use_random_seed=True, seed=42, temperature=0.1, top_p=0.3,
-                   max_tokens=8192, api_key=None, model_name="", consume_pregen=True):
+                   use_random_seed=True, seed=42, temperature=0.9, top_p=0.95,
+                   max_tokens=8192, api_key=None, model_name="", consume_pregen=True,
+                   mode_key=None, groups=1, top_k=40, enable_thinking=False,
+                   reasoning_budget=512):
         """use_api=yes 且 api_url 正确 → 调 API 产出 final_prompt; 否则 final_prompt="" 只提示。
 
         排队预生成: 先尝试命中预生成缓存 (键 = API 请求完整决定因素), 命中则直接返回,
@@ -881,7 +1156,9 @@ class H3PromptGenerator:
         seed_arg = None if use_random_seed else int(seed)
         image_mode = image is not None
         key = _pregen_key(system, prompt, url, temperature, top_p, max_tokens,
-                          seed_arg, api_key, model_name, image_mode=image_mode)
+                          seed_arg, api_key, model_name, image_mode=image_mode,
+                          top_k=top_k, enable_thinking=enable_thinking,
+                          reasoning_budget=reasoning_budget)
         # 纯文本与带参考图 (多模态) 请求都参与预生成, 但键分命名空间互不串用
         if consume_pregen:
             hit = _consume_pregen(key)
@@ -889,7 +1166,9 @@ class H3PromptGenerator:
                 return hit[0], "预生成命中 (排队时已生成, %s)" % hit[1]
         final, status = self._call_api(url, system, prompt, image=image, seed=seed_arg,
                                        temperature=temperature, top_p=top_p,
-                                       max_tokens=max_tokens,
+                                       max_tokens=max_tokens, top_k=top_k,
+                                       enable_thinking=enable_thinking,
+                                       reasoning_budget=reasoning_budget,
                                        api_key=api_key, model_name=model_name)
         # 预生成路由线程: 成功 → 写入缓存供正式执行消费
         # (带图用 replace 语义, 改图重排后新结果立即顶替旧结果)
@@ -898,10 +1177,11 @@ class H3PromptGenerator:
                 _append_pregen(key, (final, status), replace=image_mode)
         return final, status
 
-    def _build_single_system(self, mode_key, duration_seconds, 视觉风格, 音乐风格, system_extra):
-        """单段 system prompt 组装 (模式专项 + 参数块 + 用户追加规则)。"""
+    def _build_single_system(self, mode_key, duration_seconds, 视觉风格, 音乐风格, system_extra, groups=1):
+        """system prompt 组装 (模式专项 + 参数块 + 用户追加规则); 多组时参数块说明每组时长。"""
         system = self._load_system_prompt(mode_key)
-        system = system.rstrip() + "\n\n" + self._build_param_block(duration_seconds, 视觉风格, 音乐风格)
+        system = system.rstrip() + "\n\n" + self._build_param_block(
+            duration_seconds, 视觉风格, 音乐风格, mode_key, groups)
         if system_extra and system_extra.strip():
             system = system.rstrip() + "\n\n# 用户追加规则\n" + system_extra.strip()
         return system
@@ -1264,6 +1544,30 @@ class UnifiedPromptGenerator(Krea2PromptGenerator):
                     "tooltip": "仅自定义模式显示: 完全由用户指定的 system prompt。留空则用内置默认规则。",
                 }),
                 # ── 通用 ──
+                "temperature": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "仅 H3 模式显示: 采样温度。Qwen3.6 常用 0.9。",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "仅 H3 模式显示: 核采样 top_p。Qwen3.6 常用 0.95。",
+                }),
+                "top_k": ("INT", {
+                    "default": 40, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "仅 H3 模式显示: top_k 采样。Qwen3.6 常用 40；0 = 不启用。",
+                }),
+                "max_tokens": ("INT", {
+                    "default": 8192, "min": 256, "max": 32768, "step": 256,
+                    "tooltip": "仅 H3 模式显示: 输出 token 上限（不是上下文）。组数多或开思考时调到 12288–16384。",
+                }),
+                "enable_thinking": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "仅 H3 模式显示: Qwen3 思考模式（开=先推理再输出，质量更稳但慢数倍）。",
+                }),
+                "reasoning_budget": ("INT", {
+                    "default": 512, "min": -1, "max": 8192, "step": 128,
+                    "tooltip": "仅 H3 模式显示: 思考 token 预算。-1=不限、0=等同关闭；中等约 512–1024。",
+                }),
                 "system_extra": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -1286,7 +1590,9 @@ class UnifiedPromptGenerator(Krea2PromptGenerator):
               音乐风格="禁止音乐 / No Music", 画面风格="不指定 / Unspecified", 写实增强=True,
               use_api=False, api_url="", api_key=None, model_name="",
               use_random_seed=True, seed=42, custom_system_prompt="",
-              system_extra="", image=None, consume_pregen=True):
+              system_extra="", image=None, consume_pregen=True,
+              temperature=0.9, top_p=0.95, top_k=40, max_tokens=8192,
+              enable_thinking=False, reasoning_budget=512):
         """按 mode 分发到子节点实现 (行为与各专用节点完全一致); 自定义模式走 _build_custom。"""
         if mode.startswith("MiniMax"):
             return H3PromptGenerator.build(
@@ -1295,7 +1601,9 @@ class UnifiedPromptGenerator(Krea2PromptGenerator):
                 use_api=use_api, api_url=api_url, use_random_seed=use_random_seed,
                 seed=seed, system_extra=system_extra, image=image,
                 api_key=api_key, model_name=model_name,
-                consume_pregen=consume_pregen)
+                consume_pregen=consume_pregen, temperature=temperature, top_p=top_p,
+                top_k=top_k, max_tokens=max_tokens, enable_thinking=enable_thinking,
+                reasoning_budget=reasoning_budget)
         if mode.startswith("Krea"):
             return Krea2PromptGenerator.build(
                 self, user_prompt=user_prompt, 画面风格=画面风格, 写实增强=写实增强,
@@ -1384,6 +1692,28 @@ def _run_pregen_thread(node_cls, clean_inputs, count, imgs):
 try:
     from aiohttp import web
     from server import PromptServer
+
+    @PromptServer.instance.routes.post("/h3promptgen/models")
+    async def _models_route(request):
+        """body: {api_url, api_key?} → {ok, models, seconds} 或 {ok:false, error}。
+
+        前端“测试连接 / 拉取模型”按钮用; 只做 GET /v1/models, 不产生生成费用。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        api_url = (data.get("api_url") or "").strip()
+        api_key = data.get("api_key") or ""
+        if not api_url:
+            return web.json_response({"ok": False, "error": "api_url 为空"})
+        try:
+            models, secs = await asyncio.to_thread(H3PromptGenerator._fetch_models, api_url, api_key)
+            return web.json_response({"ok": True, "models": models, "seconds": round(secs, 2)})
+        except urllib.error.HTTPError as e:
+            return web.json_response({"ok": False, "error": "HTTP %s: %s" % (e.code, e.reason)})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)})
 
     @PromptServer.instance.routes.post("/h3promptgen/pregen")
     async def _pregen_route(request):
